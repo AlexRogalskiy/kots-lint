@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/instrumenta/kubeval/kubeval"
 	"github.com/mitchellh/mapstructure"
@@ -21,8 +23,12 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 )
 
+var kotsVersions map[string]bool
+var rwMutex sync.RWMutex
+
 func init() {
 	kotsscheme.AddToScheme(scheme.Scheme)
+	kotsVersions = make(map[string]bool)
 }
 
 type LintExpression struct {
@@ -138,6 +144,15 @@ func LintSpecFiles(specFiles SpecFiles) ([]LintExpression, bool, error) {
 	// if there are render content errors, end early there
 	if lintExpressionsHaveErrors(renderContentLintExpressions) {
 		return renderContentLintExpressions, false, nil
+	}
+
+	targetMinLintExpressions, err := lintTargetMinVersions(filteredFiles)
+	if err != nil {
+		return nil, false, errors.Wrap(err, "failed to lint render content")
+	}
+	// if there are target/min content errors, end early there
+	if lintExpressionsHaveErrors(targetMinLintExpressions) {
+		return targetMinLintExpressions, false, nil
 	}
 
 	opaRenderedLintExpressions, err := lintWithOPARendered(renderedFiles, filteredFiles)
@@ -337,6 +352,108 @@ func lintWithKubevalSchema(renderedFiles SpecFiles, originalFiles SpecFiles, sch
 				}
 
 				lintExpressions = append(lintExpressions, lintExpression)
+			}
+		}
+	}
+
+	return lintExpressions, nil
+}
+
+func lintTargetMinVersions(specFiles SpecFiles) ([]LintExpression, error) {
+	lintExpressions := []LintExpression{}
+	// separate multi docs because the manifest can be a part of a multi doc yaml file
+	separatedSpecFiles, err := specFiles.separate()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to separate multi docs")
+	}
+
+	url := "http://api.github.com/repos/replicatedhq/kots/commits/%s"
+	var bearer = "Bearer " + "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"
+
+	for _, spec := range separatedSpecFiles {
+		lintExpression := LintExpression{
+			Rule:    "invalid-target-kots-version",
+			Type:    "error",
+			Path:    spec.Path,
+			Message: "Invalid target kots version provided",
+		}
+
+		var tv, mv string
+		var tvExists, mvExists bool
+		doc := map[string]interface{}{}
+		if err := goyaml.Unmarshal([]byte(spec.Content), &doc); err != nil {
+			return nil, errors.Wrap(err, "failed to unmarshal spec")
+		}
+		if doc["apiVersion"] == "kots.io/v1beta1" && doc["kind"] == "Application" {
+			if spec, ok := doc["spec"].(map[interface{}]interface{}); ok {
+				tv, tvExists = spec["targetKotsVersion"].(string)
+				mv, mvExists = spec["minKotsVersion"].(string)
+			}
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to unmarshal spec content")
+		}
+
+		// if no min nor target kots version exists, return
+		if !mvExists && !tvExists {
+			return nil, nil
+		}
+
+		if tvExists {
+			version := tv
+			if !strings.HasPrefix(version, "v") {
+				version = "v" + version
+			}
+
+			rwMutex.RLock()
+			verIsCached := kotsVersions[version]
+			rwMutex.RUnlock()
+
+			if !verIsCached {
+				req, err := http.NewRequest("GET", fmt.Sprintf(url, version), nil)
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to create new request")
+				}
+				req.Header.Set("Authorization", bearer)
+				client := &http.Client{}
+				resp, err := client.Do(req)
+				if resp.StatusCode != 200 {
+					lintExpressions = append(lintExpressions, lintExpression)
+				} else if resp.StatusCode == 200 {
+					rwMutex.Lock()
+					kotsVersions[version] = true
+					rwMutex.Unlock()
+				}
+			}
+		}
+
+		if mvExists {
+			lintExpression.Rule = "invalid-min-kots-version"
+			lintExpression.Message = "Invalid min kots version provided"
+			version := mv
+			if !strings.HasPrefix(version, "v") {
+				version = "v" + version
+			}
+
+			rwMutex.RLock()
+			verIsCached := kotsVersions[version]
+			rwMutex.RUnlock()
+
+			if !verIsCached {
+				req, err := http.NewRequest("GET", fmt.Sprintf(url, version), nil)
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to create new request")
+				}
+				req.Header.Set("Authorization", bearer)
+				client := &http.Client{}
+				resp, err := client.Do(req)
+				if resp.StatusCode != 200 {
+					lintExpressions = append(lintExpressions, lintExpression)
+				} else if resp.StatusCode == 200 {
+					rwMutex.Lock()
+					kotsVersions[version] = true
+					rwMutex.Unlock()
+				}
 			}
 		}
 	}
